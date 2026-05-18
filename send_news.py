@@ -3,6 +3,7 @@ import smtplib
 import os
 import json
 import requests
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -55,7 +56,7 @@ def fetch_articles(feeds, limit=15):
             print(f"  [warn] Could not fetch {url}: {e}")
     return articles[:limit]
 
-# ── ask Gemini to pick and summarise top 5 ───────────────────────────────────
+# ── ask Gemini to pick and summarise top 5 (with retry + backoff) ─────────────
 def summarize_with_gemini(category, articles):
     prompt = f"""You are a sharp, concise news curator. Below are raw RSS articles about {category}.
 
@@ -75,26 +76,46 @@ Articles:
 {json.dumps(articles, indent=2, ensure_ascii=False)}
 """
 
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1500},
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1500},
+                },
+                timeout=30,
+            )
 
-    raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if resp.status_code == 429:
+                wait = 20 * (attempt + 1)   # 20s → 40s → 60s → 80s
+                print(f"  [rate limit] Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait)
+                continue
 
-    # strip accidental markdown fences
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+            resp.raise_for_status()
 
-    return json.loads(raw)["articles"]
+            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            # strip accidental markdown fences
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+
+            return json.loads(raw)["articles"]
+
+        except requests.exceptions.HTTPError as e:
+            if attempt < max_retries - 1:
+                wait = 20 * (attempt + 1)
+                print(f"  [http error] {e} — retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+
+    raise RuntimeError(f"Gemini failed after {max_retries} attempts for {category}")
 
 # ── build the HTML email ──────────────────────────────────────────────────────
 def build_html(sections):
@@ -142,7 +163,7 @@ def build_html(sections):
         <tr>
           <td style="background:#0f172a;padding:26px 32px;">
             <p style="margin:0;font-size:22px;font-weight:700;
-                      color:#fff;letter-spacing:-.3px;">🗞️ Daily Briefing</p>
+                      color:#fff;letter-spacing:-.3px;">Daily Briefing</p>
             <p style="margin:6px 0 0;font-size:13px;color:#94a3b8;">
               {date_str} &nbsp;·&nbsp; Jakarta, Indonesia</p>
           </td>
@@ -176,7 +197,7 @@ def build_html(sections):
 # ── send via Gmail SMTP ───────────────────────────────────────────────────────
 def send_email(html):
     jakarta = pytz.timezone("Asia/Jakarta")
-    subject = f"🗞️ Daily Briefing — {datetime.now(jakarta).strftime('%d %b %Y')}"
+    subject = f"Daily Briefing — {datetime.now(jakarta).strftime('%d %b %Y')}"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -203,9 +224,12 @@ def main():
         try:
             top5 = summarize_with_gemini(category, articles)
             sections[category] = top5
-            print(f"  ✓ Got {len(top5)} articles")
+            print(f"  Got {len(top5)} articles")
         except Exception as e:
             print(f"  [error] Gemini failed for {category}: {e}")
+
+        # polite 10s pause between categories to stay under rate limits
+        time.sleep(10)
 
     if not sections:
         raise RuntimeError("No sections were produced — aborting.")
