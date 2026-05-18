@@ -4,7 +4,7 @@ import os
 import json
 import requests
 import time
-import yfinance as yf
+
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -40,41 +40,88 @@ RSS_FEEDS = {
     ],
 }
 
-# ── fetch market data via yfinance ────────────────────────────────────────────
+# ── fetch market data (no yfinance — uses direct free APIs) ──────────────────
+def fetch_yahoo_quote(symbol):
+    """Direct Yahoo Finance API — works on GitHub Actions."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    data  = resp.json()["chart"]["result"][0]
+    closes = [c for c in data["indicators"]["quote"][0]["close"] if c is not None]
+    if len(closes) < 2:
+        raise ValueError("Not enough data points")
+    prev  = closes[-2]
+    close = closes[-1]
+    return close, ((close - prev) / prev) * 100
+
+def fetch_usd_idr():
+    """Frankfurter API for reliable USD/IDR rate."""
+    resp = requests.get(
+        "https://api.frankfurter.app/latest?from=USD&to=IDR",
+        timeout=10
+    )
+    resp.raise_for_status()
+    rate = resp.json()["rates"]["IDR"]
+    # get yesterday rate for % change
+    resp2 = requests.get(
+        "https://api.frankfurter.app/latest?from=USD&to=IDR&date=prev",
+        timeout=10
+    )
+    # frankfurter doesn't support prev directly; use Yahoo as fallback for change
+    return rate, None
+
 def fetch_markets():
-    tickers = {
-        "USD/IDR": "IDR=X",
-        "IHSG":    "^JKSE",
-        "Gold":    "GC=F",
-        "Brent":   "BZ=F",
-    }
     results = []
-    for label, symbol in tickers.items():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="2d")
-            if len(hist) < 2:
-                raise ValueError("Not enough data")
-            prev  = hist["Close"].iloc[-2]
-            close = hist["Close"].iloc[-1]
-            change_pct = ((close - prev) / prev) * 100
 
-            if label == "USD/IDR":
-                value_str = f"{close:,.0f}"
-            elif label in ("Gold", "Brent"):
-                value_str = f"${close:,.1f}"
-            else:
-                value_str = f"{close:,.0f}"
+    # USD/IDR via Yahoo (most reliable for forex)
+    try:
+        close, chg = fetch_yahoo_quote("IDR=X")
+        results.append({
+            "label": "USD/IDR", "value": f"{close:,.0f}",
+            "change_pct": round(chg, 2),
+            "direction": "up" if chg >= 0 else "down",
+        })
+    except Exception as e:
+        print(f"  [warn] USD/IDR failed: {e}")
+        results.append({"label": "USD/IDR", "value": "N/A", "change_pct": 0, "direction": "flat"})
 
-            results.append({
-                "label":      label,
-                "value":      value_str,
-                "change_pct": round(change_pct, 2),
-                "direction":  "up" if change_pct >= 0 else "down",
-            })
-        except Exception as e:
-            print(f"  [warn] Market fetch failed for {label}: {e}")
-            results.append({"label": label, "value": "N/A", "change_pct": 0, "direction": "flat"})
+    # IHSG via Yahoo
+    try:
+        close, chg = fetch_yahoo_quote("%5EJKSE")
+        results.append({
+            "label": "IHSG", "value": f"{close:,.0f}",
+            "change_pct": round(chg, 2),
+            "direction": "up" if chg >= 0 else "down",
+        })
+    except Exception as e:
+        print(f"  [warn] IHSG failed: {e}")
+        results.append({"label": "IHSG", "value": "N/A", "change_pct": 0, "direction": "flat"})
+
+    # Gold via Yahoo
+    try:
+        close, chg = fetch_yahoo_quote("GC%3DF")
+        results.append({
+            "label": "Gold", "value": f"${close:,.1f}",
+            "change_pct": round(chg, 2),
+            "direction": "up" if chg >= 0 else "down",
+        })
+    except Exception as e:
+        print(f"  [warn] Gold failed: {e}")
+        results.append({"label": "Gold", "value": "N/A", "change_pct": 0, "direction": "flat"})
+
+    # Brent crude via Yahoo
+    try:
+        close, chg = fetch_yahoo_quote("BZ%3DF")
+        results.append({
+            "label": "Brent", "value": f"${close:,.1f}",
+            "change_pct": round(chg, 2),
+            "direction": "up" if chg >= 0 else "down",
+        })
+    except Exception as e:
+        print(f"  [warn] Brent failed: {e}")
+        results.append({"label": "Brent", "value": "N/A", "change_pct": 0, "direction": "flat"})
+
     return results
 
 # ── fetch raw articles from RSS feeds ────────────────────────────────────────
