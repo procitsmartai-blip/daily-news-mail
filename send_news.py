@@ -10,7 +10,7 @@ from datetime import datetime
 import pytz
 
 # ── credentials from GitHub Secrets ──────────────────────────────────────────
-GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 EMAIL_RECIPIENTS   = [e.strip() for e in os.environ["EMAIL_RECIPIENTS"].split(",")]
@@ -56,8 +56,8 @@ def fetch_articles(feeds, limit=15):
             print(f"  [warn] Could not fetch {url}: {e}")
     return articles[:limit]
 
-# ── ask Gemini to pick and summarise top 5 (with retry + backoff) ─────────────
-def summarize_with_gemini(category, articles):
+# ── ask Groq to pick and summarise top 5 ─────────────────────────────────────
+def summarize_with_groq(category, articles):
     prompt = f"""You are a sharp, concise news curator. Below are raw RSS articles about {category}.
 
 Pick the TOP 5 most important stories and for each write:
@@ -76,27 +76,33 @@ Articles:
 {json.dumps(articles, indent=2, ensure_ascii=False)}
 """
 
-    max_retries = 4
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
                 json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1500},
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 1500,
                 },
                 timeout=30,
             )
 
             if resp.status_code == 429:
-                wait = 20 * (attempt + 1)   # 20s → 40s → 60s → 80s
+                wait = 15 * (attempt + 1)
                 print(f"  [rate limit] Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
                 time.sleep(wait)
                 continue
 
             resp.raise_for_status()
 
-            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
 
             # strip accidental markdown fences
             if raw.startswith("```"):
@@ -109,13 +115,13 @@ Articles:
 
         except requests.exceptions.HTTPError as e:
             if attempt < max_retries - 1:
-                wait = 20 * (attempt + 1)
+                wait = 15 * (attempt + 1)
                 print(f"  [http error] {e} — retrying in {wait}s...")
                 time.sleep(wait)
             else:
                 raise
 
-    raise RuntimeError(f"Gemini failed after {max_retries} attempts for {category}")
+    raise RuntimeError(f"Groq failed after {max_retries} attempts for {category}")
 
 # ── build the HTML email ──────────────────────────────────────────────────────
 def build_html(sections):
@@ -220,16 +226,15 @@ def main():
         if not articles:
             print(f"  [skip] No articles found for {category}")
             continue
-        print(f"  Summarising with Gemini...")
+        print(f"  Summarising with Groq...")
         try:
-            top5 = summarize_with_gemini(category, articles)
+            top5 = summarize_with_groq(category, articles)
             sections[category] = top5
             print(f"  Got {len(top5)} articles")
         except Exception as e:
-            print(f"  [error] Gemini failed for {category}: {e}")
+            print(f"  [error] Groq failed for {category}: {e}")
 
-        # polite 10s pause between categories to stay under rate limits
-        time.sleep(10)
+        time.sleep(3)  # small pause between categories
 
     if not sections:
         raise RuntimeError("No sections were produced — aborting.")
